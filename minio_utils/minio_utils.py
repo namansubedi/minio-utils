@@ -5,7 +5,9 @@ from dotenv import load_dotenv
 import time
 from datetime import datetime
 import threading
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict, Any, Tuple
+from collections import defaultdict
+import mimetypes
 
 class ProgressTracker(threading.Thread):
     def __init__(self, total_size: int, operation: str = "Transferring"):
@@ -42,6 +44,8 @@ class MinioClient:
             secret_key=secret_key,
             secure=secure
         )
+        # Initialize mimetypes
+        mimetypes.init()
     
     @classmethod
     def from_env(cls, env_file: str = '.env.local'):
@@ -61,6 +65,204 @@ class MinioClient:
             raise ValueError("MINIO_ENDPOINT, MINIO_ACCESS_KEY, and MINIO_SECRET_KEY must be set in environment file")
         
         return cls(endpoint, access_key, secret_key)
+    
+    def _get_file_type(self, filename: str) -> str:
+        """
+        Get file type
+        
+        Args:
+            filename: Name of the file
+            
+        Returns:
+            str: File type
+        """
+        mime_type, _ = mimetypes.guess_type(filename)
+        if mime_type is None:
+            return "file"
+        
+        # Map common MIME types to readable names
+        mime_types = {
+            'image/': 'image',
+            'video/': 'video',
+            'audio/': 'audio',
+            'text/': 'text',
+            'application/pdf': 'pdf',
+            'application/zip': 'archive',
+            'application/json': 'json',
+            'application/xml': 'xml',
+            'application/javascript': 'javascript',
+            'application/x-python': 'python',
+        }
+        
+        for prefix, type_name in mime_types.items():
+            if mime_type.startswith(prefix):
+                return type_name
+        return "file"
+    
+    def _format_size(self, size_bytes: int) -> str:
+        """
+        Format size in bytes to human readable format
+        
+        Args:
+            size_bytes: Size in bytes
+            
+        Returns:
+            str: Formatted size string
+        """
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.2f} PB"
+    
+    def _format_date(self, date: datetime) -> str:
+        """
+        Format date to readable string
+        
+        Args:
+            date: Datetime object
+            
+        Returns:
+            str: Formatted date string
+        """
+        return date.strftime("%Y-%m-%d %H:%M")
+    
+    def _build_tree(self, objects: List[Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Build a tree structure from a list of objects
+        
+        Args:
+            objects: List of MinIO objects
+            
+        Returns:
+            Tuple containing:
+            - Dict: Tree structure
+            - Dict: Folder statistics (total size and file count)
+        """
+        tree = defaultdict(lambda: {"files": [], "subfolders": {}})
+        stats = defaultdict(lambda: {"size": 0, "count": 0})
+        
+        for obj in objects:
+            parts = obj.object_name.split('/')
+            current = tree
+            current_path = []
+            
+            # Handle folders
+            for i, part in enumerate(parts[:-1]):
+                if part:  # Skip empty parts
+                    current_path.append(part)
+                    if part not in current:
+                        current[part] = {"files": [], "subfolders": {}}
+                    current = current[part]["subfolders"]
+                    # Update folder stats
+                    stats['/'.join(current_path)]["size"] += obj.size
+                    stats['/'.join(current_path)]["count"] += 1
+            
+            # Handle file
+            if parts[-1]:  # If there's a file (not just a folder)
+                current["files"].append({
+                    "name": parts[-1],
+                    "size": obj.size,
+                    "last_modified": obj.last_modified,
+                    "type": self._get_file_type(parts[-1])
+                })
+        
+        return dict(tree), dict(stats)
+    
+    def _print_tree(self, tree: Dict[str, Any], stats: Dict[str, Dict[str, int]], 
+                   prefix: str = "", is_last: bool = True, current_path: str = "") -> None:
+        """
+        Print the tree structure
+        
+        Args:
+            tree: Tree structure to print
+            stats: Folder statistics
+            prefix: Current prefix for indentation
+            is_last: Whether this is the last item at this level
+            current_path: Current path in the tree
+        """
+        items = list(tree.items())
+        for i, (name, content) in enumerate(items):
+            is_last_item = i == len(items) - 1
+            marker = "└── " if is_last_item else "├── "
+            new_path = f"{current_path}/{name}" if current_path else name
+            
+            # Get folder stats
+            folder_stats = stats.get(new_path, {"size": 0, "count": 0})
+            folder_size = self._format_size(folder_stats["size"])
+            file_count = folder_stats["count"]
+            
+            # Print folder with stats
+            print(f"{prefix}{marker}[DIR] {name}/")
+            print(f"{prefix}{'    ' if is_last_item else '│   '}    "
+                  f"Size: {folder_size} | Files: {file_count}")
+            
+            # Print files in this folder
+            for j, file in enumerate(content["files"]):
+                is_last_file = j == len(content["files"]) - 1 and not content["subfolders"]
+                file_marker = "└── " if is_last_file else "├── "
+                file_size = self._format_size(file["size"])
+                mod_date = self._format_date(file["last_modified"])
+                
+                print(f"{prefix}{'    ' if is_last_item else '│   '}{file_marker}"
+                      f"[{file['type'].upper()}] {file['name']}")
+                print(f"{prefix}{'    ' if is_last_item else '│   '}    "
+                      f"Size: {file_size} | Modified: {mod_date}")
+            
+            # Print subfolders
+            new_prefix = prefix + ("    " if is_last_item else "│   ")
+            self._print_tree(content["subfolders"], stats, new_prefix, is_last_item, new_path)
+    
+    def list_bucket_structure(self, bucket_name: str, prefix: str = "") -> None:
+        """
+        Display a tree-like structure of the bucket contents
+        
+        Args:
+            bucket_name (str): Name of the bucket to list
+            prefix (str): Optional prefix to filter objects (default: "")
+        """
+        if not self.client.bucket_exists(bucket_name):
+            print(f"Bucket '{bucket_name}' does not exist")
+            return
+        
+        # Get all objects
+        objects = list(self.client.list_objects(bucket_name, prefix=prefix, recursive=True))
+        
+        if not objects:
+            print(f"Bucket '{bucket_name}' is empty")
+            return
+        
+        # Build and print tree
+        print(f"\nStructure of bucket '{bucket_name}':")
+        print("─" * 80)
+        tree, stats = self._build_tree(objects)
+        self._print_tree(tree, stats)
+        print("─" * 80)
+        
+        # Print total bucket statistics
+        total_size = sum(obj.size for obj in objects)
+        total_files = len(objects)
+        print(f"\nBucket Statistics:")
+        print(f"Total Size: {self._format_size(total_size)}")
+        print(f"Total Files: {total_files}")
+    
+    def list_buckets(self) -> List[Dict[str, Union[str, datetime]]]:
+        """
+        List all buckets in the MinIO server
+        
+        Returns:
+            List[Dict]: List of dictionaries containing bucket information:
+                - name (str): Name of the bucket
+                - creation_date (datetime): When the bucket was created
+        """
+        buckets = self.client.list_buckets()
+        return [
+            {
+                'name': bucket.name,
+                'creation_date': bucket.creation_date
+            }
+            for bucket in buckets
+        ]
     
     def ensure_bucket_exists(self, bucket_name: str) -> None:
         """Ensure bucket exists, create if it doesn't"""
