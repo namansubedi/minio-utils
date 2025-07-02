@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 import threading
 from typing import Optional, Union, List, Dict, Any, Tuple
-from collections import defaultdict
+import collections
 import mimetypes
 
 class ProgressTracker(threading.Thread):
@@ -128,46 +128,56 @@ class MinioClient:
         return date.strftime("%Y-%m-%d %H:%M")
     
     def _build_tree(self, objects: List[Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
-        """
-        Build a tree structure from a list of objects
-        
-        Args:
-            objects: List of MinIO objects
-            
-        Returns:
-            Tuple containing:
-            - Dict: Tree structure
-            - Dict: Folder statistics (total size and file count)
-        """
-        tree = defaultdict(lambda: {"files": [], "subfolders": {}})
-        stats = defaultdict(lambda: {"size": 0, "count": 0})
-        
-        for obj in objects:
-            parts = obj.object_name.split('/')
-            current = tree
-            current_path = []
-            
-            # Handle folders
-            for i, part in enumerate(parts[:-1]):
-                if part:  # Skip empty parts
-                    current_path.append(part)
-                    if part not in current:
-                        current[part] = {"files": [], "subfolders": {}}
-                    current = current[part]["subfolders"]
-                    # Update folder stats
-                    stats['/'.join(current_path)]["size"] += obj.size
-                    stats['/'.join(current_path)]["count"] += 1
-            
-            # Handle file
-            if parts[-1]:  # If there's a file (not just a folder)
-                current["files"].append({
-                    "name": parts[-1],
-                    "size": obj.size,
-                    "last_modified": obj.last_modified,
-                    "type": self._get_file_type(parts[-1])
-                })
-        
-        return dict(tree), dict(stats)
+            """
+            Build a tree structure from a list of objects
+
+            Args:
+                objects: List of MinIO objects
+
+            Returns:
+                Tuple containing:
+                - Dict: Tree structure
+                - Dict: Folder statistics (total size and file count)
+            """
+            tree = collections.defaultdict(lambda: {"files": [], "subfolders": {}})
+            stats = collections.defaultdict(lambda: {"size": 0, "count": 0})
+
+            for obj in objects:
+                parts = obj.object_name.split('/')
+                current_level = tree
+                current_path_parts = []
+
+                # Iterate through parts to build the folder structure, excluding the last part (potential file name)
+                # The loop goes up to parts[:-1] to handle the directory structure
+                for part in parts[:-1]:
+                    if part:  # Skip empty parts (e.g., if object_name starts or ends with '/')
+                        current_path_parts.append(part)
+                        # Ensure the subfolder dict exists at the current level's subfolders
+                        if part not in current_level["subfolders"]:
+                            current_level["subfolders"][part] = {"files": [], "subfolders": {}}
+                        current_level = current_level["subfolders"][part] # Move deeper into the tree for the next iteration
+
+                        # Update folder stats for this specific folder path
+                        path_str = '/'.join(current_path_parts)
+                        stats[path_str]["size"] += obj.size
+                        stats[path_str]["count"] += 1
+
+                # Handle the file itself (the last part)
+                file_name = parts[-1]
+                if file_name:  # If there's a file (not just a folder path ending with /)
+                    current_level["files"].append({
+                        "name": file_name,
+                        "size": obj.size,
+                        "last_modified": obj.last_modified,
+                        "type": self._get_file_type(file_name)
+                    })
+                    # For files directly at the root, their stats need to be added to the "" path
+                    if not current_path_parts:
+                        stats[""]["size"] += obj.size
+                        stats[""]["count"] += 1
+
+
+            return dict(tree), dict(stats) # Convert defaultdicts back to regular dicts for return
     
     def _print_tree(self, tree: Dict[str, Any], stats: Dict[str, Dict[str, int]], 
                    prefix: str = "", is_last: bool = True, current_path: str = "") -> None:
