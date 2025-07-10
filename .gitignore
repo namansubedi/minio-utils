@@ -38,3 +38,7 @@ ENV/
 # Distribution
 dist/
 build/ 
+
+# Test files
+tests/
+*.ipynb

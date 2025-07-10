@@ -127,128 +127,109 @@ class MinioClient:
         """
         return date.strftime("%Y-%m-%d %H:%M")
     
-    def _build_tree(self, objects: List[Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
-            """
-            Build a tree structure from a list of objects
-
-            Args:
-                objects: List of MinIO objects
-
-            Returns:
-                Tuple containing:
-                - Dict: Tree structure
-                - Dict: Folder statistics (total size and file count)
-            """
-            tree = collections.defaultdict(lambda: {"files": [], "subfolders": {}})
-            stats = collections.defaultdict(lambda: {"size": 0, "count": 0})
-
-            for obj in objects:
-                parts = obj.object_name.split('/')
-                current_level = tree
-                current_path_parts = []
-
-                # Iterate through parts to build the folder structure, excluding the last part (potential file name)
-                # The loop goes up to parts[:-1] to handle the directory structure
-                for part in parts[:-1]:
-                    if part:  # Skip empty parts (e.g., if object_name starts or ends with '/')
-                        current_path_parts.append(part)
-                        # Ensure the subfolder dict exists at the current level's subfolders
-                        if part not in current_level["subfolders"]:
-                            current_level["subfolders"][part] = {"files": [], "subfolders": {}}
-                        current_level = current_level["subfolders"][part] # Move deeper into the tree for the next iteration
-
-                        # Update folder stats for this specific folder path
-                        path_str = '/'.join(current_path_parts)
-                        stats[path_str]["size"] += obj.size
-                        stats[path_str]["count"] += 1
-
-                # Handle the file itself (the last part)
-                file_name = parts[-1]
-                if file_name:  # If there's a file (not just a folder path ending with /)
-                    current_level["files"].append({
-                        "name": file_name,
-                        "size": obj.size,
-                        "last_modified": obj.last_modified,
-                        "type": self._get_file_type(file_name)
-                    })
-                    # For files directly at the root, their stats need to be added to the "" path
-                    if not current_path_parts:
-                        stats[""]["size"] += obj.size
-                        stats[""]["count"] += 1
-
-
-            return dict(tree), dict(stats) # Convert defaultdicts back to regular dicts for return
-    
-    def _print_tree(self, tree: Dict[str, Any], stats: Dict[str, Dict[str, int]], 
-                   prefix: str = "", is_last: bool = True, current_path: str = "") -> None:
+    def _build_tree(self, objects: list) -> tuple:
         """
-        Print the tree structure
-        
+        Build a tree structure from a list of objects (robust, no defaultdicts)
+
         Args:
-            tree: Tree structure to print
-            stats: Folder statistics
-            prefix: Current prefix for indentation
-            is_last: Whether this is the last item at this level
-            current_path: Current path in the tree
+            objects: List of MinIO objects
+
+        Returns:
+            Tuple containing:
+            - Dict: Tree structure
+            - Dict: Folder statistics (total size and file count)
         """
-        items = list(tree.items())
-        for i, (name, content) in enumerate(items):
-            is_last_item = i == len(items) - 1
+        tree = {"files": [], "subfolders": {}}
+        stats = {"": {"size": 0, "count": 0}}  # root stats
+
+        for obj in objects:
+            parts = [p for p in obj.object_name.split('/') if p]
+            current = tree
+            path_parts = []
+
+            # Traverse/create subfolders
+            for part in parts[:-1]:
+                path_parts.append(part)
+                path_str = '/'.join(path_parts)
+                if part not in current["subfolders"]:
+                    current["subfolders"][part] = {"files": [], "subfolders": {}}
+                current = current["subfolders"][part]
+                # Update stats for this folder
+                if path_str not in stats:
+                    stats[path_str] = {"size": 0, "count": 0}
+                stats[path_str]["size"] += obj.size
+                stats[path_str]["count"] += 1
+
+            # Handle the file itself (the last part)
+            if parts:
+                file_name = parts[-1]
+                current["files"].append({
+                    "name": file_name,
+                    "size": obj.size,
+                    "last_modified": obj.last_modified,
+                    "type": self._get_file_type(file_name)
+                })
+                if path_parts:
+                    # Add to last folder's stats
+                    stats['/'.join(path_parts)]["size"] += 0  # already added above
+                    stats['/'.join(path_parts)]["count"] += 0
+                else:
+                    # File at root
+                    stats[""]["size"] += obj.size
+                    stats[""]["count"] += 1
+        return tree, stats
+
+    def _print_tree(self, tree: dict, stats: dict, prefix: str = "", is_last: bool = True, current_path: str = "") -> None:
+        """
+        Print the tree structure (robust, no defaultdicts)
+        """
+        subfolders = list(tree["subfolders"].items())
+        for i, (name, content) in enumerate(subfolders):
+            is_last_item = i == len(subfolders) - 1
             marker = "└── " if is_last_item else "├── "
             new_path = f"{current_path}/{name}" if current_path else name
-            
-            # Get folder stats
             folder_stats = stats.get(new_path, {"size": 0, "count": 0})
             folder_size = self._format_size(folder_stats["size"])
             file_count = folder_stats["count"]
-            
-            # Print folder with stats
             print(f"{prefix}{marker}[DIR] {name}/")
-            print(f"{prefix}{'    ' if is_last_item else '│   '}    "
-                  f"Size: {folder_size} | Files: {file_count}")
-            
+            print(f"{prefix}{'    ' if is_last_item else '│   '}    Size: {folder_size} | Files: {file_count}")
             # Print files in this folder
             for j, file in enumerate(content["files"]):
                 is_last_file = j == len(content["files"]) - 1 and not content["subfolders"]
                 file_marker = "└── " if is_last_file else "├── "
                 file_size = self._format_size(file["size"])
                 mod_date = self._format_date(file["last_modified"])
-                
-                print(f"{prefix}{'    ' if is_last_item else '│   '}{file_marker}"
-                      f"[{file['type'].upper()}] {file['name']}")
-                print(f"{prefix}{'    ' if is_last_item else '│   '}    "
-                      f"Size: {file_size} | Modified: {mod_date}")
-            
-            # Print subfolders
+                print(f"{prefix}{'    ' if is_last_item else '│   '}{file_marker}[{file['type'].upper()}] {file['name']}")
+                print(f"{prefix}{'    ' if is_last_item else '│   '}    Size: {file_size} | Modified: {mod_date}")
+            # Print subfolders recursively
             new_prefix = prefix + ("    " if is_last_item else "│   ")
-            self._print_tree(content["subfolders"], stats, new_prefix, is_last_item, new_path)
-    
+            self._print_tree(content, stats, new_prefix, is_last_item, new_path)
+        # Print files at the current (root) level
+        if not current_path:
+            for j, file in enumerate(tree["files"]):
+                is_last_file = j == len(tree["files"]) - 1 and not tree["subfolders"]
+                file_marker = "└── " if is_last_file else "├── "
+                file_size = self._format_size(file["size"])
+                mod_date = self._format_date(file["last_modified"])
+                print(f"{prefix}{file_marker}[{file['type'].upper()}] {file['name']}")
+                print(f"{prefix}    Size: {file_size} | Modified: {mod_date}")
+
     def list_bucket_structure(self, bucket_name: str, prefix: str = "") -> None:
         """
-        Display a tree-like structure of the bucket contents
-        
-        Args:
-            bucket_name (str): Name of the bucket to list
-            prefix (str): Optional prefix to filter objects (default: "")
+        Display a tree-like structure of the bucket contents (robust, safe)
         """
         if not self.client.bucket_exists(bucket_name):
             print(f"Bucket '{bucket_name}' does not exist")
             return
-        
-        # Get all objects
         objects = list(self.client.list_objects(bucket_name, prefix=prefix, recursive=True))
-        
         if not objects:
             print(f"Bucket '{bucket_name}' is empty")
             return
-        
-        # Build and print tree
         print(f"\nStructure of bucket '{bucket_name}':")
         print("─" * 80)
         tree, stats = self._build_tree(objects)
         self._print_tree(tree, stats)
         print("─" * 80)
-        
         # Print total bucket statistics
         total_size = sum(obj.size for obj in objects)
         total_files = len(objects)
